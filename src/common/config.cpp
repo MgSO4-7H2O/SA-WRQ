@@ -1,0 +1,71 @@
+#include "common/config.h"
+
+#include <fstream>
+#include <regex>
+#include <sstream>
+
+namespace ann {
+
+namespace {
+
+bool ExtractUint(const std::string& text, const std::string& key, uint32_t* out) {
+  std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+  std::smatch match;
+  if (std::regex_search(text, match, re)) {
+    *out = static_cast<uint32_t>(std::stoul(match[1]));
+    return true;
+  }
+  return false;
+}
+
+bool ExtractBool(const std::string& text, const std::string& key, bool* out) {
+  std::regex re("\"" + key + "\"\\s*:\\s*(true|false)");
+  std::smatch match;
+  if (std::regex_search(text, match, re)) {
+    *out = (match[1] == "true");
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+std::string Config::ToString() const {
+  std::ostringstream oss;
+  oss << "Config{"
+      << "rvq_layers=" << rvq_layers << ", "
+      << "rvq_codewords=" << rvq_codewords << ", "
+      << "ivf_nlist=" << ivf_nlist << ", "
+      << "topk=" << topk << ", "
+      << "nprobe=" << nprobe << ", "
+      << "use_whitening=" << std::boolalpha << use_whitening << ", "
+      << "enable_dual_route=" << std::boolalpha << enable_dual_route << ", "
+      << "dim=" << dim << ", "
+      << "seed=" << seed << "}";
+  return oss.str();
+}
+
+Result<Config> LoadConfigFromJson(const std::string& path) {
+  std::ifstream ifs(path);
+  if (!ifs) {
+    return Status::IOError("Failed to open config: " + path);
+  }
+  std::stringstream buffer;
+  buffer << ifs.rdbuf();
+  const std::string text = buffer.str();
+
+  Config cfg;
+  ExtractUint(text, "rvq_layers", &cfg.rvq_layers);
+  ExtractUint(text, "rvq_codewords", &cfg.rvq_codewords);
+  ExtractUint(text, "ivf_nlist", &cfg.ivf_nlist);
+  ExtractUint(text, "topk", &cfg.topk);
+  ExtractUint(text, "nprobe", &cfg.nprobe);
+  ExtractUint(text, "dim", &cfg.dim);
+  ExtractUint(text, "seed", &cfg.seed);
+  ExtractBool(text, "use_whitening", &cfg.use_whitening);
+  ExtractBool(text, "enable_dual_route", &cfg.enable_dual_route);
+
+  return cfg;
+}
+
+}  // namespace ann

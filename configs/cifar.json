@@ -1,1 +1,11 @@
-// CIFAR dataset configuration placeholder.
+{
+  "rvq_layers": 4,
+  "rvq_codewords": 256,
+  "ivf_nlist": 4096,
+  "topk": 50,
+  "nprobe": 32,
+  "use_whitening": false,
+  "enable_dual_route": true,
+  "dim": 64,
+  "seed": 2024
+}

@@ -1,1 +1,114 @@
-// Interface compliance tests placeholder.
+#include <cassert>
+#include <cstdio>
+#include <iostream>
+
+#include <Eigen/Dense>
+
+#include "common/config.h"
+#include "common/serialization.h"
+#include "common/types.h"
+#include "eval/gt.h"
+#include "eval/metrics.h"
+#include "index/ivf.h"
+#include "index/postings.h"
+#include "monitor/drift.h"
+#include "quant/rvq.h"
+#include "search/rerank.h"
+#include "whitening/whitening.h"
+
+using namespace ann;
+
+int main() {
+  Config cfg;
+  cfg.dim = 8;
+  MatrixRM X = MatrixRM::Random(4, cfg.dim);
+
+  auto whitening = CreateWhiteningModel();
+  auto rvq = CreateRVQCodebook();
+  auto ivf = CreateIVFIndex();
+
+  auto whiten_version = whitening->Fit(X);
+  assert(whiten_version.ok());
+
+  Eigen::VectorXf sample = X.row(0).transpose();
+  Eigen::VectorXf xw(cfg.dim);
+  auto transform_status = whitening->Transform(sample, whiten_version.value(), xw);
+  assert(transform_status.ok());
+
+  RVQParams params;
+  params.num_layers = 2;
+  params.codewords = 4;
+  auto rvq_version = rvq->Train(X, params);
+  assert(rvq_version.ok());
+
+  std::vector<uint32_t> codes;
+  Eigen::VectorXf residual(cfg.dim);
+  auto encode_status = rvq->Encode(xw, rvq_version.value(), &codes, &residual);
+  assert(encode_status.ok());
+
+  std::vector<DocId> ids = {0, 1, 2, 3};
+  IVFParams ivf_params;
+  ivf_params.nlist = 2;
+  ivf_params.dim = cfg.dim;
+  auto ivf_version = ivf->Build(X, ids, ivf_params, 1);
+  assert(ivf_version.ok());
+
+  VectorRecord rec;
+  rec.doc_id = 0;
+  rec.dim = cfg.dim;
+  rec.versions = VersionSet{whiten_version.value(), rvq_version.value(), ivf_version.value()};
+  rec.ivf_id = 0;
+  rec.codes = codes;
+  rec.x = sample;
+  AlignedVector<VectorRecord> recs = {rec};
+  assert(ivf->Add(recs).ok());
+
+  VersionSet routes = rec.versions;
+  auto search_res = ivf->Search(xw, 2, 1, routes, 0);
+  assert(search_res.ok());
+
+  VersionSet bad_routes = routes;
+  bad_routes.index_version = 999;
+  auto bad_search = ivf->Search(xw, 1, 1, bad_routes, 0);
+  assert(!bad_search.ok());
+
+  PostingStore posting_store;
+  assert(posting_store.AddPosting(routes.index_version, 0, rec).ok());
+  auto posting_view = posting_store.GetPostingList(routes.index_version, 0);
+  assert(posting_view.ok());
+
+  auto serialized = rvq->Serialize();
+  assert(serialized.ok());
+  assert(rvq->Deserialize(serialized.value()).ok());
+
+  std::vector<uint8_t> payload = {1, 2, 3};
+  const std::string tmp_file = "test_serialization.bin";
+  auto save_status = SaveBinary(tmp_file, payload);
+  assert(save_status.ok());
+  auto load_res = LoadBinary(tmp_file);
+  assert(load_res.ok());
+  std::remove(tmp_file.c_str());
+
+  std::vector<std::vector<DocId>> gt = {{0, 1}, {1, 2}};
+  std::vector<std::vector<DocId>> pred = {{1, 0}, {0, 2}};
+  auto recall = RecallAtK(gt, pred, 2);
+  assert(recall.ok());
+
+  auto gt_res = ComputeGroundTruth(X, X, 2);
+  assert(gt_res.ok());
+
+  DriftMonitor monitor;
+  assert(monitor.ObserveResidual(X).ok());
+  Eigen::VectorXf margins = Eigen::VectorXf::Ones(3);
+  assert(monitor.ObserveSearchSignal(margins).ok());
+  assert(monitor.ShouldUpdateTail().ok());
+
+  std::vector<Candidate> cands(1);
+  cands[0].doc_id = 0;
+  auto rerank_status = RerankL2(sample, &cands, [&](DocId) -> Result<Eigen::VectorXf> {
+    return sample;
+  });
+  assert(rerank_status.ok());
+
+  return 0;
+}

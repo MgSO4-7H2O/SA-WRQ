@@ -1,1 +1,11 @@
-// SIFT dataset configuration placeholder.
+{
+  "rvq_layers": 8,
+  "rvq_codewords": 256,
+  "ivf_nlist": 8192,
+  "topk": 100,
+  "nprobe": 64,
+  "use_whitening": true,
+  "enable_dual_route": true,
+  "dim": 128,
+  "seed": 1337
+}
