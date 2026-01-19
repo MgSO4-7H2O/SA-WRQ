@@ -1,0 +1,1 @@
+// Ground truth loader placeholder.

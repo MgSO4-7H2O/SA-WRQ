@@ -1,0 +1,1 @@
+// RVQCodebook interface placeholder.

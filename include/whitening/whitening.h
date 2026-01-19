@@ -1,0 +1,1 @@
+// WhiteningModel interface placeholder.

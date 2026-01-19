@@ -1,0 +1,1 @@
+// Postings storage implementation placeholder.

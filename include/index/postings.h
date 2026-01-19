@@ -1,0 +1,1 @@
+// Versioned postings storage placeholder.

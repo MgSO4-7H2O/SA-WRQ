@@ -1,0 +1,1 @@
+// Lightweight timing helper placeholder.

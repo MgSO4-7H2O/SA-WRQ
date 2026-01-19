@@ -1,0 +1,1 @@
+# Root CMake configuration placeholder.
