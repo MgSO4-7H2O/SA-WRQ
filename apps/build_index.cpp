@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <iostream>
+#include <optional>
 #include <random>
 
 #include <Eigen/Dense>
 
 #include "common/config.h"
+#include "common/dataset.h"
 #include "common/result.h"
 #include "common/types.h"
 #include "index/ivf.h"
@@ -44,15 +46,46 @@ int main(int argc, char** argv) {
     std::cerr << config_res.status().ToString() << std::endl;
     return 1;
   }
-  const Config config = config_res.value();
+  Config config = config_res.value();
   std::cout << "Loaded " << config.ToString() << std::endl;
 
   auto whitening = CreateWhiteningModel();
   auto rvq = CreateRVQCodebook();
   auto ivf = CreateIVFIndex();
 
-  const uint32_t num_vectors = 32;
-  MatrixRM X = GenerateRandomMatrix(num_vectors, config.dim, config.seed);
+  std::optional<std::string> base_dataset_path;
+  if (argc > 2) {
+    auto resolved = ResolveFvecsPath(argv[2], "_base.fvecs");
+    if (!resolved.ok()) {
+      std::cerr << resolved.status().ToString() << std::endl;
+      return 1;
+    }
+    base_dataset_path = resolved.value();
+    std::cout << "[INFO] Using base dataset: " << *base_dataset_path << std::endl;
+  }
+
+  MatrixRM X;
+  uint32_t num_vectors = 0;
+  if (base_dataset_path) {
+    auto matrix_res = LoadFvecs(*base_dataset_path);
+    if (!matrix_res.ok()) {
+      std::cerr << matrix_res.status().ToString() << std::endl;
+      return 1;
+    }
+    X = matrix_res.value();
+    num_vectors = static_cast<uint32_t>(X.rows());
+    if (num_vectors == 0) {
+      std::cerr << "Base dataset contains no vectors." << std::endl;
+      return 1;
+    }
+    if (config.dim != static_cast<uint32_t>(X.cols())) {
+      std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << X.cols() << std::endl;
+      config.dim = static_cast<uint32_t>(X.cols());
+    }
+  } else {
+    num_vectors = 32;
+    X = GenerateRandomMatrix(num_vectors, config.dim, config.seed);
+  }
 
   auto whiten_version_res = whitening->Fit(X);
   if (!whiten_version_res.ok()) {

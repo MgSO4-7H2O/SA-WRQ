@@ -1,10 +1,12 @@
 #include <cassert>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 
 #include <Eigen/Dense>
 
 #include "common/config.h"
+#include "common/dataset.h"
 #include "common/serialization.h"
 #include "common/types.h"
 #include "eval/gt.h"
@@ -109,6 +111,29 @@ int main() {
     return sample;
   });
   assert(rerank_status.ok());
+
+  {
+    const std::string tmp_fvecs = "test_vectors.fvecs";
+    {
+      std::ofstream ofs(tmp_fvecs, std::ios::binary | std::ios::trunc);
+      auto write_vec = [&](std::initializer_list<float> vals) {
+        int32_t dim = static_cast<int32_t>(vals.size());
+        ofs.write(reinterpret_cast<const char*>(&dim), sizeof(int32_t));
+        for (float v : vals) {
+          ofs.write(reinterpret_cast<const char*>(&v), sizeof(float));
+        }
+      };
+      write_vec({1.0f, 2.0f});
+      write_vec({3.0f, 4.0f});
+    }
+    auto matrix_res = LoadFvecs(tmp_fvecs);
+    assert(matrix_res.ok());
+    const MatrixRM& mat = matrix_res.value();
+    assert(mat.rows() == 2);
+    assert(mat.cols() == 2);
+    assert(mat(0, 0) == 1.0f);
+    std::remove(tmp_fvecs.c_str());
+  }
 
   return 0;
 }

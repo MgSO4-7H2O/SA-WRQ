@@ -6,6 +6,7 @@ include(cmake/Options.cmake)
 find_package(Eigen3 REQUIRED)
 
 add_library(ann
+  src/common/dataset.cpp
   src/common/config.cpp
   src/common/serialization.cpp
   src/whitening/whitening.cpp

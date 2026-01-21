@@ -2,10 +2,10 @@
   "rvq_layers": 4,
   "rvq_codewords": 256,
   "ivf_nlist": 4096,
-  "topk": 50,
+  "topk": 100,
   "nprobe": 32,
   "use_whitening": false,
-  "enable_dual_route": true,
-  "dim": 64,
+  "enable_dual_route": false,
+  "dim": 512,
   "seed": 2024
 }
