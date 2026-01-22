@@ -4,6 +4,7 @@ project(ann LANGUAGES CXX)
 include(cmake/Options.cmake)
 
 find_package(Eigen3 REQUIRED)
+find_package(OpenMP REQUIRED)
 
 add_library(ann
   src/common/dataset.cpp
@@ -14,6 +15,7 @@ add_library(ann
   src/index/ivf.cpp
   src/index/postings.cpp
   src/search/hybrid_search.cpp
+  src/search/exact_search.cpp
   src/search/rerank.cpp
   src/eval/gt.cpp
   src/eval/metrics.cpp
@@ -21,7 +23,7 @@ add_library(ann
 )
 
 target_include_directories(ann PUBLIC include third_party)
-target_link_libraries(ann PUBLIC Eigen3::Eigen)
+target_link_libraries(ann PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX)
 ann_set_warnings(ann)
 
 add_executable(build_index apps/build_index.cpp)

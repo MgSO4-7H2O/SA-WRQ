@@ -9,6 +9,18 @@ class ConcreteHybridSearcher : public HybridSearcher {
  public:
   explicit ConcreteHybridSearcher(Config config) : config_(std::move(config)) {}
 
+  Status SetIndex(std::shared_ptr<IVFIndex> index, const VersionSet& versions) override {
+    if (!index) {
+      return Status::InvalidArgument("index is null");
+    }
+    if (versions.index_version == 0) {
+      return Status::InvalidArgument("index_version must be set");
+    }
+    ivf_ = std::move(index);
+    route_versions_ = versions;
+    return Status::OK();
+  }
+
   Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> query,
                               const SearchParams& params) const override {
     if (static_cast<uint32_t>(query.size()) != config_.dim) {
@@ -17,21 +29,23 @@ class ConcreteHybridSearcher : public HybridSearcher {
     if (params.topk == 0) {
       return Status::InvalidArgument("topk must be positive");
     }
-    SearchResult result;
-    for (uint32_t i = 0; i < params.topk; ++i) {
-      Candidate c;
-      c.doc_id = i;
-      c.approx_dist = query.squaredNorm() + static_cast<float>(i);
-      c.rerank_dist = c.approx_dist;
-      c.versions = VersionSet{0, 0, 0};
-      c.from_new = params.enable_dual_route ? 1 : 0;
-      result.topk.push_back(c);
+    if (!ivf_) {
+      return Status::Unavailable("IVF index not initialized");
     }
+    auto search_res = ivf_->Search(query, params.topk, params.nprobe, route_versions_,
+                                   params.enable_dual_route ? 1 : 0);
+    if (!search_res.ok()) {
+      return search_res.status();
+    }
+    SearchResult result;
+    result.topk = std::move(search_res.value());
     return result;
   }
 
  private:
   Config config_;
+  std::shared_ptr<IVFIndex> ivf_;
+  VersionSet route_versions_{};
 };
 
 }  // namespace

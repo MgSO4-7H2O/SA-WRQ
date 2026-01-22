@@ -4,9 +4,10 @@
 
 #include <Eigen/Dense>
 
+#include "common/config.h"
 #include "common/result.h"
 #include "common/types.h"
-#include "common/config.h"
+#include "index/ivf.h"
 
 namespace ann {
 
@@ -20,6 +21,9 @@ struct SearchParams {
 class HybridSearcher {
  public:
   virtual ~HybridSearcher() = default;
+
+  // NTS: Injects the IVF index and associated route versions before serving traffic.
+  virtual Status SetIndex(std::shared_ptr<IVFIndex> index, const VersionSet& versions) = 0;
 
   // TS: Executes retrieval given a single query vector.
   virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> query,
