@@ -23,6 +23,10 @@ class WhiteningModel {
                                  VersionId version,
                                  Eigen::Ref<Eigen::VectorXf> out_xw) const = 0;
 
+  // TS: Applies whitening transform to a batch matrix (each row a vector).
+  virtual Result<MatrixRM> TransformBatch(Eigen::Ref<const MatrixRM> X,
+                                          VersionId version) const = 0;
+
   // NTS: Updates running stats using a single sample.
   virtual Status UpdateStats(Eigen::Ref<const Eigen::VectorXf> x) = 0;
 

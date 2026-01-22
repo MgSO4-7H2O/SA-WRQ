@@ -1,3 +1,4 @@
+#undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include "index/postings.h"
 #include "monitor/drift.h"
 #include "quant/rvq.h"
+#include "search/hybrid_search.h"
 #include "search/rerank.h"
 #include "whitening/whitening.h"
 
@@ -31,11 +33,18 @@ int main() {
 
   auto whiten_version = whitening->Fit(X);
   assert(whiten_version.ok());
+  auto batch_whiten = whitening->TransformBatch(X, whiten_version.value());
+  assert(batch_whiten.ok());
+  MatrixRM whitened = batch_whiten.value();
+  assert(whitened.rows() == X.rows());
+  assert(whitened.cols() == X.cols());
 
   Eigen::VectorXf sample = X.row(0).transpose();
   Eigen::VectorXf xw(cfg.dim);
   auto transform_status = whitening->Transform(sample, whiten_version.value(), xw);
   assert(transform_status.ok());
+  auto bridge = whitening->Bridge(whiten_version.value(), whiten_version.value());
+  assert(bridge.ok());
 
   RVQParams params;
   params.num_layers = 2;
@@ -73,6 +82,19 @@ int main() {
   bad_routes.index_version = 999;
   auto bad_search = ivf->Search(xw, 1, 1, bad_routes, 0);
   assert(!bad_search.ok());
+
+  auto hybrid_res = CreateHybridSearcher(cfg);
+  assert(hybrid_res.ok());
+  auto searcher = std::move(hybrid_res.value());
+  VersionSet route_versions{whiten_version.value(), 0, ivf_version.value()};
+  assert(searcher->SetIndex(ivf, route_versions).ok());
+  assert(searcher->SetWhitening(whitening, whiten_version.value()).ok());
+  SearchParams search_params;
+  search_params.topk = 2;
+  search_params.nprobe = 1;
+  search_params.use_whitening = true;
+  auto hybrid_search = searcher->Search(sample, search_params);
+  assert(hybrid_search.ok());
 
   PostingStore posting_store;
   assert(posting_store.AddPosting(routes.index_version, 0, rec).ok());
@@ -128,7 +150,7 @@ int main() {
     }
     auto matrix_res = LoadFvecs(tmp_fvecs);
     assert(matrix_res.ok());
-    const MatrixRM& mat = matrix_res.value();
+    const MatrixRM mat = matrix_res.value();
     assert(mat.rows() == 2);
     assert(mat.cols() == 2);
     assert(mat(0, 0) == 1.0f);

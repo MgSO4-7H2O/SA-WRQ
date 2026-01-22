@@ -21,6 +21,17 @@ class ConcreteHybridSearcher : public HybridSearcher {
     return Status::OK();
   }
 
+  Status SetWhitening(std::shared_ptr<WhiteningModel> model, VersionId version) override {
+    if (!model) {
+      whitening_.reset();
+      whitening_version_ = 0;
+      return Status::OK();
+    }
+    whitening_ = std::move(model);
+    whitening_version_ = version;
+    return Status::OK();
+  }
+
   Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> query,
                               const SearchParams& params) const override {
     if (static_cast<uint32_t>(query.size()) != config_.dim) {
@@ -32,8 +43,25 @@ class ConcreteHybridSearcher : public HybridSearcher {
     if (!ivf_) {
       return Status::Unavailable("IVF index not initialized");
     }
-    auto search_res = ivf_->Search(query, params.topk, params.nprobe, route_versions_,
-                                   params.enable_dual_route ? 1 : 0);
+    if (whitening_) {
+      Eigen::VectorXf query_buf(query.size());
+      auto tstatus = whitening_->Transform(query, whitening_version_, query_buf);
+      if (!tstatus.ok()) {
+        return tstatus.status();
+      }
+      auto search_res =
+          ivf_->Search(query_buf, params.topk, params.nprobe, route_versions_,
+                       params.enable_dual_route ? 1 : 0);
+      if (!search_res.ok()) {
+        return search_res.status();
+      }
+      SearchResult result;
+      result.topk = std::move(search_res.value());
+      return result;
+    }
+    auto search_res =
+        ivf_->Search(query, params.topk, params.nprobe, route_versions_,
+                     params.enable_dual_route ? 1 : 0);
     if (!search_res.ok()) {
       return search_res.status();
     }
@@ -46,6 +74,8 @@ class ConcreteHybridSearcher : public HybridSearcher {
   Config config_;
   std::shared_ptr<IVFIndex> ivf_;
   VersionSet route_versions_{};
+  std::shared_ptr<WhiteningModel> whitening_;
+  VersionId whitening_version_{0};
 };
 
 }  // namespace

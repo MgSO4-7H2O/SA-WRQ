@@ -8,6 +8,7 @@
 #include "common/result.h"
 #include "common/types.h"
 #include "index/ivf.h"
+#include "whitening/whitening.h"
 
 namespace ann {
 
@@ -24,6 +25,9 @@ class HybridSearcher {
 
   // NTS: Injects the IVF index and associated route versions before serving traffic.
   virtual Status SetIndex(std::shared_ptr<IVFIndex> index, const VersionSet& versions) = 0;
+
+  // NTS: Optionally injects a whitening model snapshot applied on every query.
+  virtual Status SetWhitening(std::shared_ptr<WhiteningModel> model, VersionId version) = 0;
 
   // TS: Executes retrieval given a single query vector.
   virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> query,

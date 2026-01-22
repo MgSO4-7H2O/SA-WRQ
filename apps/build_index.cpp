@@ -87,18 +87,30 @@ int main(int argc, char** argv) {
     X = GenerateRandomMatrix(num_vectors, config.dim, config.seed);
   }
 
-  auto whiten_version_res = whitening->Fit(X);
-  if (!whiten_version_res.ok()) {
-    std::cerr << whiten_version_res.status().ToString() << std::endl;
-    return 1;
+  MatrixRM X_for_ivf = X;
+  VersionId whiten_version = 0;
+  if (config.use_whitening) {
+    auto whiten_version_res = whitening->Fit(X);
+    if (!whiten_version_res.ok()) {
+      std::cerr << whiten_version_res.status().ToString() << std::endl;
+      return 1;
+    }
+    whiten_version = whiten_version_res.value();
+    auto batch_res = whitening->TransformBatch(X, whiten_version);
+    if (!batch_res.ok()) {
+      std::cerr << batch_res.status().ToString() << std::endl;
+      return 1;
+    }
+    X_for_ivf = batch_res.value();
   }
-  VersionId whiten_version = whiten_version_res.value();
 
   RVQParams rvq_params;
   rvq_params.num_layers = config.rvq_layers;
   rvq_params.codewords = config.rvq_codewords;
 
-  auto rvq_version_res = rvq->Train(X, rvq_params);
+  MatrixRM rvq_train = config.use_whitening ? X_for_ivf : X;
+
+  auto rvq_version_res = rvq->Train(rvq_train, rvq_params);
   if (!rvq_version_res.ok()) {
     std::cerr << rvq_version_res.status().ToString() << std::endl;
     return 1;
@@ -113,7 +125,7 @@ int main(int argc, char** argv) {
   IVFParams ivf_params;
   ivf_params.nlist = std::max(1u, config.ivf_nlist);
   ivf_params.dim = config.dim;
-  auto ivf_version_res = ivf->Build(X, ids, ivf_params, 1);
+  auto ivf_version_res = ivf->Build(X_for_ivf, ids, ivf_params, 1);
   if (!ivf_version_res.ok()) {
     std::cerr << ivf_version_res.status().ToString() << std::endl;
     return 1;
@@ -128,14 +140,16 @@ int main(int argc, char** argv) {
     rec.dim = config.dim;
     rec.versions = VersionSet{whiten_version, rvq_version, ivf_version};
     rec.ivf_id = i % std::max(1u, ivf_params.nlist);
-    rec.x = X.row(i).transpose();
-
-    Eigen::VectorXf xw(config.dim);
-    auto transform_res = whitening->Transform(rec.x, whiten_version, xw);
-    if (!transform_res.ok()) {
-      std::cerr << transform_res.status().ToString() << std::endl;
-      return 1;
+    Eigen::VectorXf original = X.row(i).transpose();
+    Eigen::VectorXf xw = original;
+    if (config.use_whitening) {
+      auto transform_res = whitening->Transform(original, whiten_version, xw);
+      if (!transform_res.ok()) {
+        std::cerr << transform_res.status().ToString() << std::endl;
+        return 1;
+      }
     }
+    rec.x = xw;
 
     Eigen::VectorXf residual(config.dim);
     std::vector<uint32_t> codes;
