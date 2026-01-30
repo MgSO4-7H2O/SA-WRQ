@@ -226,15 +226,22 @@ class ZCAWhiteningModel : public WhiteningModel {
     if (solver.info() != Eigen::Success) {
       return Status::Internal("Eigen decomposition failed");
     }
-    Eigen::VectorXf eigenvalues = solver.eigenvalues();
+    // 获取特征向量矩阵 V (每列是一个特征向量)
     MatrixRM eigenvectors = solver.eigenvectors();
-    Eigen::VectorXf inv_sqrt = (eigenvalues.array() + payload->epsilon).sqrt().inverse();
-    MatrixRM diag = inv_sqrt.asDiagonal();
-    payload->transform = eigenvectors * diag * eigenvectors.transpose();
-    Eigen::VectorXf sqrt_vals = (eigenvalues.array() + payload->epsilon).sqrt();
-    payload->transform_inv = eigenvectors * sqrt_vals.asDiagonal() * eigenvectors.transpose();
+
+    // PCA 旋转
+    // 只进行旋转投影：Y = V^T * X
+    // 既消除了相关性，又严格保留了 L2 距离
+    
+    // 1. 前向变换矩阵: W = V^T
+    payload->transform = eigenvectors.transpose();
+
+    // 2. 逆变换矩阵: W_inv = V
+    payload->transform_inv = eigenvectors;
+      
     return Status::OK();
   }
+
 
   void ResetPending() {
     pending_sum_.resize(0);

@@ -1,9 +1,9 @@
 {
-  "rvq_layers": 4,
+  "rvq_layers": 8,
   "rvq_codewords": 256,
   "ivf_nlist": 1024,
   "topk": 100,
-  "nprobe": 32,
+  "nprobe": 64,
   "use_whitening": true,
   "enable_dual_route": false,
   "dim": 512,

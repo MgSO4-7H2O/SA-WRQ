@@ -7,6 +7,7 @@
 
 #include "common/result.h"
 #include "common/types.h"
+#include "quant/rvq.h"
 
 namespace ann {
 
@@ -36,6 +37,9 @@ class IVFIndex {
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;
+
+  // 引入RVQ量化器
+  virtual void SetQuantizer(std::shared_ptr<RVQCodebook> quantizer, VersionId ver) = 0;
 };
 
 std::shared_ptr<IVFIndex> CreateIVFIndex();

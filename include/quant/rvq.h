@@ -39,6 +39,9 @@ class RVQCodebook {
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;
+
+  // LUT预计算：计算 query 与 RVQ 码本各中心点的内积表 (num_layers x codewords)
+  virtual Result<MatrixRM> ComputeInnerProductTable(Eigen::Ref<const Eigen::VectorXf> query, VersionId version) const = 0;
 };
 
 std::shared_ptr<RVQCodebook> CreateRVQCodebook();

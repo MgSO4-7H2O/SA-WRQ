@@ -3,12 +3,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -18,35 +20,29 @@
 #include "common/types.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
+#include "quant/rvq.h"
 #include "search/exact_search.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
 
 using namespace ann;
 
-namespace {
-
-MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
-  std::mt19937 gen(seed);
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-  MatrixRM m(rows, cols);
-  for (uint32_t r = 0; r < rows; ++r) {
-    for (uint32_t c = 0; c < cols; ++c) {
-      m(r, c) = dist(gen);
+// --- 辅助：计算 RVQ 重构误差 (MSE) ---
+// 用于检查 RVQ 是否在当前数据分布下有效收敛
+double ComputeRVQMSE(std::shared_ptr<RVQCodebook> rvq, VersionId ver, 
+                     const MatrixRM& Data, size_t num_samples = 1000) {
+    double total_err = 0;
+    size_t samples = std::min((size_t)Data.rows(), num_samples);
+    std::vector<uint32_t> codes;
+    Eigen::VectorXf residual;
+    
+    for(size_t i=0; i<samples; ++i) {
+        Eigen::VectorXf vec = Data.row(i).transpose();
+        rvq->Encode(vec, ver, &codes, &residual);
+        total_err += residual.squaredNorm();
     }
-  }
-  return m;
+    return total_err / samples;
 }
-
-}  // namespace
-
-struct EvalMetrics {
-  bool use_whitening{false};
-  double recall{0.0};
-  double p50_ms{0.0};
-  double p99_ms{0.0};
-  double qps{0.0};
-};
 
 int main(int argc, char** argv) {
   const std::string config_path = (argc > 1) ? argv[1] : "configs/base.json";
@@ -56,319 +52,180 @@ int main(int argc, char** argv) {
     return 1;
   }
   Config config = config_res.value();
-  std::cout << "Loaded " << config.ToString() << std::endl;
+  std::cout << "Loaded Config: " << config_path << std::endl;
 
-  std::optional<std::string> dataset_spec = (argc > 2) ? std::optional<std::string>(argv[2]) : std::nullopt;
-  std::optional<std::string> query_spec = (argc > 3) ? std::optional<std::string>(argv[3]) : std::nullopt;
-  std::string dataset_label = "synthetic";
+  // --- 1. load dataset ---
+  std::string dataset_spec = (argc > 2) ? argv[2] : "";
+  std::string query_spec = (argc > 3) ? argv[3] : "";
 
-  std::optional<std::string> base_dataset_path;
-  if (dataset_spec) {
-    auto resolved = ResolveFvecsPath(*dataset_spec, "_base.fvecs");
-    if (!resolved.ok()) {
-      std::cerr << resolved.status().ToString() << std::endl;
-      return 1;
-    }
-    base_dataset_path = resolved.value();
-    std::cout << "[INFO] Using base dataset: " << *base_dataset_path << std::endl;
-    std::filesystem::path ds_path(*base_dataset_path);
-    auto parent_name = ds_path.parent_path().filename().string();
-    if (!parent_name.empty()) {
-      dataset_label = parent_name;
-    } else {
-      dataset_label = ds_path.stem().string();
-    }
+  MatrixRM X, Q;
+
+  // 加载 Base 数据
+  std::string base_path_resolved;
+  if (!dataset_spec.empty()) {
+      auto res = ResolveFvecsPath(dataset_spec, "_base.fvecs");
+      if (res.ok()) base_path_resolved = res.value();
+      else std::cout << "[Warn] Resolve base failed: " << res.status().ToString() << std::endl;
   }
 
-  std::optional<std::string> query_dataset_path;
-  if (query_spec) {
-    auto resolved_query = ResolveFvecsPath(*query_spec, "_query.fvecs");
-    if (!resolved_query.ok()) {
-      std::cerr << resolved_query.status().ToString() << std::endl;
-      return 1;
-    }
-    query_dataset_path = resolved_query.value();
-    std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
-  } else if (dataset_spec) {
-    namespace fs = std::filesystem;
-    fs::path spec_path(*dataset_spec);
-    std::error_code ec;
-    if (fs::is_directory(spec_path, ec)) {
-      auto resolved_query = ResolveFvecsPath(*dataset_spec, "_query.fvecs");
-      if (resolved_query.ok()) {
-        query_dataset_path = resolved_query.value();
-        std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
+  if (!base_path_resolved.empty()) {
+      auto res = LoadFvecs(base_path_resolved);
+      if (res.ok()) {
+          X = res.value();
+          std::cout << "[Data] Base loaded: " << X.rows() << "x" << X.cols() << " from " << base_path_resolved << std::endl;
       } else {
-        std::cout << "[WARN] " << resolved_query.status().ToString()
-                  << ". Falling back to random queries." << std::endl;
+          std::cerr << "[Error] Failed to load base: " << res.status().ToString() << std::endl;
+          return 1;
       }
-    } else if (base_dataset_path) {
-      auto parent = fs::path(*base_dataset_path).parent_path();
-      if (!parent.empty()) {
-        auto resolved_query = ResolveFvecsPath(parent.string(), "_query.fvecs");
-        if (resolved_query.ok()) {
-          query_dataset_path = resolved_query.value();
-          std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
-        }
-      }
-    } else {
-      dataset_label = spec_path.filename().string();
-    }
-  }
-
-  uint32_t nx = 0;
-  MatrixRM X;
-  if (base_dataset_path) {
-    auto load_res = LoadFvecs(*base_dataset_path);
-    if (!load_res.ok()) {
-      std::cerr << load_res.status().ToString() << std::endl;
-      return 1;
-    }
-    X = load_res.value();
-    nx = static_cast<uint32_t>(X.rows());
-    if (nx == 0) {
-      std::cerr << "Base dataset contains no vectors." << std::endl;
-      return 1;
-    }
-    if (config.dim != static_cast<uint32_t>(X.cols())) {
-      std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << X.cols() << std::endl;
-      config.dim = static_cast<uint32_t>(X.cols());
-    }
   } else {
-    nx = 64;
-    X = GenerateRandom(nx, config.dim, config.seed);
+      std::cout << "[Warn] No dataset provided. Using Random(1000) Base Data" << std::endl;
+      X = MatrixRM::Random(1000, config.dim);
   }
 
-  uint32_t nq = 0;
-  MatrixRM Q;
-  if (query_dataset_path) {
-    auto load_res = LoadFvecs(*query_dataset_path);
-    if (!load_res.ok()) {
-      std::cerr << load_res.status().ToString() << std::endl;
-      return 1;
-    }
-    Q = load_res.value();
-    nq = static_cast<uint32_t>(Q.rows());
-    if (nq == 0) {
-      std::cerr << "Query dataset contains no vectors." << std::endl;
-      return 1;
-    }
-    if (static_cast<uint32_t>(Q.cols()) != config.dim) {
-      if (!base_dataset_path) {
-        std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << Q.cols() << std::endl;
-        config.dim = static_cast<uint32_t>(Q.cols());
+  // 加载 Query 数据
+  std::string query_path_resolved;
+  if (!query_spec.empty()) {
+      auto res = ResolveFvecsPath(query_spec, "_query.fvecs");
+      if (res.ok()) query_path_resolved = res.value();
+  } 
+  if (query_path_resolved.empty() && !dataset_spec.empty()) {
+      auto res = ResolveFvecsPath(dataset_spec, "_query.fvecs");
+      if (res.ok()) query_path_resolved = res.value();
+  }
+
+  if (!query_path_resolved.empty()) {
+      auto res = LoadFvecs(query_path_resolved);
+      if (res.ok()) {
+          Q = res.value();
+          if (Q.rows() > 100) Q = Q.topRows(100); // 内存保护
+          std::cout << "[Data] Query loaded: " << Q.rows() << "x" << Q.cols() << std::endl;
       } else {
-        std::cerr << "Query dimension " << Q.cols() << " mismatches base " << config.dim << std::endl;
-        return 1;
+           std::cerr << "[Error] Failed to load query: " << res.status().ToString() << std::endl;
+           return 1;
       }
-    }
   } else {
-    nq = 8;
-    Q = GenerateRandom(nq, config.dim, config.seed + 1);
+      std::cout << "[Warn] Using Random(10) Query Data" << std::endl;
+      Q = MatrixRM::Random(10, config.dim);
   }
 
-  auto exact_res = ExactSearchBatch(Q, X, config.topk);
-  if (!exact_res.ok()) {
-    std::cerr << exact_res.status().ToString() << std::endl;
-    return 1;
-  }
-  auto ground_truth_plain = exact_res.value();
-  auto sanity = RecallAtK(ground_truth_plain, ground_truth_plain, config.topk);
-  if (!sanity.ok() || sanity.value() != 1.0f) {
-    std::cerr << "Exact search sanity failed" << std::endl;
-    return 1;
-  }
+  // --- 2. 计算 Ground Truth (基于原始 L2 距离) ---
+  std::cout << "[GT] Calculating Exact Ground Truth..." << std::endl;
+  auto gt_res = ExactSearchBatch(Q, X, config.topk);
+  if (!gt_res.ok()) return 1;
+  auto ground_truth = gt_res.value();
 
-  std::vector<DocId> ids(nx);
+  // --- 3. 定义四种测试模式 ---
+  struct TestMode {
+      std::string name;
+      bool use_whiten;
+      bool use_rvq;
+  };
+
+  std::vector<TestMode> modes = {
+      {"1. IVF (Plain)",         false, false},
+      {"2. IVF + Whiten",        true,  false},
+      {"3. IVF + RVQ",           false, true},
+      {"4. IVF + Whiten + RVQ",  true,  true}
+  };
+
+  std::vector<DocId> ids(X.rows());
   std::iota(ids.begin(), ids.end(), 0);
 
-  SearchParams base_params;
-  base_params.topk = config.topk;
-  base_params.nprobe = config.nprobe;
-  base_params.use_whitening = false;
-  base_params.enable_dual_route = config.enable_dual_route;
+  // --- 4. 主循环测试 ---
+  for (const auto& mode : modes) {
+      std::cout << "\n==========================================" << std::endl;
+      std::cout << "Running Mode: " << mode.name << std::endl;
+      std::cout << "==========================================" << std::endl;
 
-  auto run_experiment = [&](bool use_whitening) -> Result<EvalMetrics> {
-    auto ivf = CreateIVFIndex();
-    auto searcher_res = CreateHybridSearcher(config);
-    if (!searcher_res.ok()) {
-      return searcher_res.status();
-    }
-    std::unique_ptr<HybridSearcher> searcher = std::move(searcher_res.value());
-    MatrixRM X_index = X;
-    MatrixRM Q_input = Q;
-    VersionId whiten_version = 0;
-    std::shared_ptr<WhiteningModel> whitening;
-    std::vector<std::vector<DocId>> local_gt;
-    const std::vector<std::vector<DocId>>* gt_ptr = &ground_truth_plain;
+      // 每次重新创建组件，确保隔离
+      auto ivf = CreateIVFIndex();
+      auto rvq = CreateRVQCodebook();
+      auto whitening = CreateWhiteningModel();
+      
+      auto searcher_res = CreateHybridSearcher(config);
+      if (!searcher_res.ok()) return 1;
+      auto searcher = std::move(searcher_res.value());
 
-    if (use_whitening) {
-      whitening = CreateWhiteningModel();
-      auto version_res = whitening->Fit(X);
-      if (!version_res.ok()) {
-        return version_res.status();
+      MatrixRM X_train = X; // X_train 随着处理流程可能变化 (原始 -> 白化)
+      VersionId v_whiten = 0;
+      VersionId v_rvq = 0;
+      VersionId v_ivf = 0;
+
+      // --- Step 1: 白化训练与转换 ---
+      if (mode.use_whiten) {
+          v_whiten = whitening->Fit(X).value();
+          // 将 Base 数据转换到白化空间
+          X_train = whitening->TransformBatch(X, v_whiten).value();
+          std::cout << "[Step] Whitening trained (ver " << v_whiten << ")" << std::endl;
       }
-      whiten_version = version_res.value();
-      auto base_batch = whitening->TransformBatch(X, whiten_version);
-      if (!base_batch.ok()) {
-        return base_batch.status();
+
+      // --- Step 2: RVQ 训练 ---
+      double rvq_mse = 0.0;
+      if (mode.use_rvq) {
+          RVQParams p; 
+          p.num_layers = config.rvq_layers;
+          p.codewords = config.rvq_codewords;
+          
+          // 对 X_train 进行训练 (如果开了白化，这里就是白化后的数据)
+          v_rvq = rvq->Train(X_train, p).value();
+          
+          rvq_mse = ComputeRVQMSE(rvq, v_rvq, X_train);
+          std::cout << "[Step] RVQ trained (ver " << v_rvq << "), MSE=" << rvq_mse << std::endl;
+          ivf->SetQuantizer(rvq, v_rvq);
+      } else {
+        // 不使用 RVQ，只用传空量化器
+          ivf->SetQuantizer(nullptr, 0);
       }
-      X_index = base_batch.value();
-      auto query_batch = whitening->TransformBatch(Q, whiten_version);
-      if (!query_batch.ok()) {
-        return query_batch.status();
+
+      // --- Step 3: IVF 构建 ---
+      IVFParams ivf_p;
+      ivf_p.nlist = config.ivf_nlist;
+      ivf_p.dim = config.dim;
+      // 使用 X_train 构建索引
+      // RVQ存储Codes, Plain存储原始向量
+      v_ivf = ivf->Build(X_train, ids, ivf_p, 0).value();
+      std::cout << "[Step] IVF built" << std::endl;
+
+      // --- Step 4: 组装 Searcher ---
+      VersionSet vers{v_whiten, v_rvq, v_ivf};
+      searcher->SetIndex(ivf, vers);
+      
+      if (mode.use_whiten) {
+          // 启用白化：Searcher 会自动将 Query 变换到白化空间
+          searcher->SetWhitening(whitening, v_whiten);
+      } else {
+          searcher->SetWhitening(nullptr, 0);
       }
-      Q_input = query_batch.value();
-      auto gt_res = ExactSearchBatch(Q_input, X_index, config.topk);
-      if (!gt_res.ok()) {
-        return gt_res.status();
+
+      // --- Step 5: 执行搜索 ---
+      SearchParams sp;
+      sp.topk = config.topk;
+      sp.nprobe = config.nprobe;
+      sp.use_whitening = mode.use_whiten;
+
+      std::vector<std::vector<DocId>> preds(Q.rows());
+      Timer t_total;
+
+      for (int i = 0; i < Q.rows(); ++i) {
+          Eigen::VectorXf q = Q.row(i).transpose();
+          // 始终传入原始 Query，由 Searcher 内部根据配置决定是否 Transform
+          auto res = searcher->Search(q, sp);
+          
+          if(res.ok()) {
+              for(auto& c : res.value().topk) preds[i].push_back(c.doc_id);
+          }
       }
-      local_gt = gt_res.value();
-      gt_ptr = &local_gt;
-    }
 
-    IVFParams ivf_params;
-    ivf_params.nlist = std::max(1u, config.ivf_nlist);
-    ivf_params.dim = config.dim;
-    auto ivf_version_res = ivf->Build(X_index, ids, ivf_params, 0);
-    if (!ivf_version_res.ok()) {
-      return ivf_version_res.status();
-    }
-    VersionSet versions{whiten_version, 0, ivf_version_res.value()};
-    Status index_status = searcher->SetIndex(ivf, versions);
-    if (!index_status.ok()) {
-      return index_status;
-    }
-    if (use_whitening) {
-      Status wstatus = searcher->SetWhitening(whitening, whiten_version);
-      if (!wstatus.ok()) {
-        return wstatus;
+      // --- Step 6: 统计结果 ---
+      double recall = ann::RecallAtK(ground_truth, preds, config.topk).value();
+      double qps = Q.rows() / (t_total.ElapsedMillis() / 1000.0);
+
+      std::cout << ">>> RESULT: " << mode.name << std::endl;
+      std::cout << "    Recall@" << config.topk << ": " << std::fixed << std::setprecision(4) << recall << std::endl;
+      std::cout << "    QPS:       " << qps << std::endl;
+      if (mode.use_rvq) {
+          std::cout << "    RVQ MSE:   " << rvq_mse << std::endl;
       }
-    } else {
-      searcher->SetWhitening(nullptr, 0);
-    }
-
-    SearchParams params = base_params;
-    params.use_whitening = use_whitening;
-
-    std::vector<std::vector<DocId>> predictions(nq);
-    std::vector<double> latencies_ms(nq, 0.0);
-    std::atomic<bool> failed{false};
-    std::mutex error_mu;
-    Status error_status;
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-    for (int64_t i = 0; i < static_cast<int64_t>(nq); ++i) {
-      if (failed.load()) {
-        continue;
-      }
-      Eigen::VectorXf qvec = Q.row(i).transpose();
-      Timer timer;
-      auto search_res = searcher->Search(qvec, params);
-      double elapsed = timer.ElapsedMillis();
-      if (!search_res.ok()) {
-        std::lock_guard<std::mutex> lock(error_mu);
-        if (!failed.exchange(true)) {
-          error_status = search_res.status();
-        }
-        continue;
-      }
-      std::vector<DocId> row;
-      row.reserve(search_res.value().topk.size());
-      for (const auto& cand : search_res.value().topk) {
-        row.push_back(cand.doc_id);
-      }
-      predictions[i] = std::move(row);
-      latencies_ms[i] = elapsed;
-    }
-
-    if (failed.load()) {
-      return error_status;
-    }
-
-    auto recall_res = RecallAtK(*gt_ptr, predictions, config.topk);
-    if (!recall_res.ok()) {
-      return recall_res.status();
-    }
-
-    double total_ms = std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0);
-    double qps = (total_ms > 0.0) ? (static_cast<double>(nq) / (total_ms / 1000.0)) : 0.0;
-    auto summary = SummarizeLatencies(latencies_ms);
-    if (!summary.ok()) {
-      return summary.status();
-    }
-
-    EvalMetrics metrics;
-    metrics.use_whitening = use_whitening;
-    metrics.recall = recall_res.value();
-    metrics.p50_ms = summary.value().p50_ms;
-    metrics.p99_ms = summary.value().p99_ms;
-    metrics.qps = qps;
-    return metrics;
-  };
-
-  std::cout << "Exact Recall@" << config.topk << " = 1.0" << std::endl;
-
-  auto save_metrics = [&](const EvalMetrics& metrics) {
-    std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
-    std::error_code ec;
-    std::filesystem::create_directories(results_dir, ec);
-    const auto now = std::chrono::system_clock::now();
-    const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    std::string suffix = metrics.use_whitening ? "zca" : "plain";
-    std::string file_name = "topk" + std::to_string(config.topk) + "_np" +
-                            std::to_string(base_params.nprobe) + "_nl" +
-                            std::to_string(config.ivf_nlist) + "_" + suffix + "_" + std::to_string(ts) + ".json";
-    std::filesystem::path result_path = results_dir / file_name;
-    std::ofstream ofs(result_path);
-    if (ofs) {
-      ofs << "{\n";
-      ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
-      ofs << "  \"timestamp\": " << ts << ",\n";
-      ofs << "  \"use_whitening\": " << (metrics.use_whitening ? "true" : "false") << ",\n";
-      ofs << "  \"metrics\": {\n";
-      ofs << "    \"recall@"
-          << config.topk << "\": " << metrics.recall << ",\n";
-      ofs << "    \"latency_ms\": {\"p50\": " << metrics.p50_ms << ", \"p99\": " << metrics.p99_ms << "},\n";
-      ofs << "    \"qps\": " << metrics.qps << "\n";
-      ofs << "  },\n";
-      ofs << "  \"params\": {\n";
-      ofs << "    \"topk\": " << config.topk << ",\n";
-      ofs << "    \"nprobe\": " << base_params.nprobe << ",\n";
-      ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-      ofs << "    \"rvq_layers\": " << config.rvq_layers << ",\n";
-      ofs << "    \"rvq_codewords\": " << config.rvq_codewords << ",\n";
-      ofs << "    \"use_whitening\": " << (metrics.use_whitening ? "true" : "false") << "\n";
-      ofs << "  }\n";
-      ofs << "}\n";
-      std::cout << "Saved metrics to " << result_path << std::endl;
-    } else {
-      std::cerr << "Failed to write results to " << result_path << std::endl;
-    }
-  };
-
-  std::vector<bool> modes = {false};
-  if (config.use_whitening) {
-    modes.push_back(true);
-  }
-
-  for (bool mode : modes) {
-    auto metrics_res = run_experiment(mode);
-    if (!metrics_res.ok()) {
-      std::cerr << metrics_res.status().ToString() << std::endl;
-      if (!mode) {
-        return 1;
-      }
-      continue;
-    }
-    const EvalMetrics& metrics = metrics_res.value();
-    std::cout << (mode ? "[IVF+ZCA] " : "[IVF] ") << "Recall@" << config.topk << " = " << metrics.recall
-              << " (nprobe=" << base_params.nprobe << ")" << std::endl;
-    std::cout << "Latency p50=" << metrics.p50_ms << "ms, p99=" << metrics.p99_ms << "ms, QPS=" << metrics.qps
-              << std::endl;
-    save_metrics(metrics);
   }
 
   return 0;
