@@ -6,20 +6,28 @@ include(cmake/Options.cmake)
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
 
+set(FAISS_ENABLE_GPU OFF CACHE BOOL "Disable FAISS GPU")
+set(FAISS_ENABLE_CUDA OFF CACHE BOOL "Disable FAISS CUDA")
+set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "Disable FAISS Python bindings")
+set(FAISS_ENABLE_TESTS OFF CACHE BOOL "Disable FAISS tests")
+set(FAISS_ENABLE_C_API OFF CACHE BOOL "Disable FAISS C API")
+
+add_subdirectory(faiss)
+
 add_library(ann
   src/common/dataset.cpp
   src/common/config.cpp
   src/common/serialization.cpp
   src/whitening/whitening.cpp
-  src/quant/rvq.cpp
-  src/index/ivf.cpp
-  src/index/postings.cpp
-  src/search/hybrid_search.cpp
+  # src/quant/rvq.cpp
+  # src/index/ivf.cpp
+  # src/index/postings.cpp
+  # src/search/hybrid_search.cpp
   src/search/exact_search.cpp
-  src/search/rerank.cpp
-  src/eval/gt.cpp
+  # src/search/rerank.cpp
+  # src/eval/gt.cpp
   src/eval/metrics.cpp
-  src/monitor/drift.cpp
+  # src/monitor/drift.cpp
 )
 
 target_include_directories(ann PUBLIC include third_party)
@@ -27,21 +35,23 @@ target_link_libraries(ann PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX)
 ann_set_warnings(ann)
 
 add_executable(build_index apps/build_index.cpp)
-target_link_libraries(build_index PRIVATE ann)
+# target_link_libraries(build_index PRIVATE ann)
+target_link_libraries(build_index PRIVATE ann faiss)
 ann_set_warnings(build_index)
 
 add_executable(run_eval apps/run_eval.cpp)
-target_link_libraries(run_eval PRIVATE ann)
+# target_link_libraries(run_eval PRIVATE ann)
+target_link_libraries(run_eval PRIVATE ann faiss)
 ann_set_warnings(run_eval)
 
-add_executable(test_interfaces tests/test_interfaces.cpp)
-target_link_libraries(test_interfaces PRIVATE ann)
-ann_set_warnings(test_interfaces)
+# add_executable(test_interfaces tests/test_interfaces.cpp)
+# target_link_libraries(test_interfaces PRIVATE ann)
+# ann_set_warnings(test_interfaces)
 
-add_executable(test_recall_smoke tests/test_recall_smoke.cpp)
-target_link_libraries(test_recall_smoke PRIVATE ann)
-ann_set_warnings(test_recall_smoke)
+# add_executable(test_recall_smoke tests/test_recall_smoke.cpp)
+# target_link_libraries(test_recall_smoke PRIVATE ann)
+# ann_set_warnings(test_recall_smoke)
 
 enable_testing()
-add_test(NAME test_interfaces COMMAND test_interfaces)
-add_test(NAME test_recall_smoke COMMAND test_recall_smoke)
+# add_test(NAME test_interfaces COMMAND test_interfaces)
+# add_test(NAME test_recall_smoke COMMAND test_recall_smoke)

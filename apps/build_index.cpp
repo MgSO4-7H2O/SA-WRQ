@@ -1,40 +1,31 @@
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <optional>
 #include <random>
+#include <string>
 
 #include <Eigen/Dense>
 
+#include <faiss/index_factory.h>
+#include <faiss/index_io.h>
+#include <faiss/IndexIVF.h>
+
 #include "common/config.h"
 #include "common/dataset.h"
-#include "common/result.h"
-#include "common/types.h"
-#include "index/ivf.h"
-#include "quant/rvq.h"
 #include "whitening/whitening.h"
 
 using namespace ann;
 
 namespace {
 
-MatrixRM GenerateRandomMatrix(uint32_t rows, uint32_t cols, uint32_t seed) {
-  std::mt19937 gen(seed);
-  std::normal_distribution<float> dist(0.0f, 1.0f);
-  MatrixRM m(rows, cols);
-  for (uint32_t r = 0; r < rows; ++r) {
-    for (uint32_t c = 0; c < cols; ++c) {
-      m(r, c) = dist(gen);
-    }
+  std::string BuildFaissFactoryKey(const Config& config, bool use_rvq) {
+    if (!use_rvq) {
+      return "IVF" + std::to_string(config.ivf_nlist) + ",Flat";
   }
-  return m;
-}
-
-void LogStatus(const Status& status, const std::string& step) {
-  if (!status.ok()) {
-    std::cerr << "[ERROR] " << step << ": " << status.ToString() << std::endl;
-  } else {
-    std::cout << "[INFO] " << step << " OK" << std::endl;
-  }
+  const uint32_t nbits = static_cast<uint32_t>(std::log2(config.rvq_codewords));
+  return "IVF" + std::to_string(config.ivf_nlist) + ",RQ" +
+         std::to_string(config.rvq_layers) + "x" + std::to_string(nbits);  
 }
 
 }  // namespace
@@ -49,10 +40,6 @@ int main(int argc, char** argv) {
   Config config = config_res.value();
   std::cout << "Loaded " << config.ToString() << std::endl;
 
-  auto whitening = CreateWhiteningModel();
-  auto rvq = CreateRVQCodebook();
-  auto ivf = CreateIVFIndex();
-
   std::optional<std::string> base_dataset_path;
   if (argc > 2) {
     auto resolved = ResolveFvecsPath(argv[2], "_base.fvecs");
@@ -64,112 +51,52 @@ int main(int argc, char** argv) {
     std::cout << "[INFO] Using base dataset: " << *base_dataset_path << std::endl;
   }
 
-  MatrixRM X;
-  uint32_t num_vectors = 0;
-  if (base_dataset_path) {
-    auto matrix_res = LoadFvecs(*base_dataset_path);
-    if (!matrix_res.ok()) {
-      std::cerr << matrix_res.status().ToString() << std::endl;
-      return 1;
-    }
-    X = matrix_res.value();
-    num_vectors = static_cast<uint32_t>(X.rows());
-    if (num_vectors == 0) {
-      std::cerr << "Base dataset contains no vectors." << std::endl;
-      return 1;
-    }
-    if (config.dim != static_cast<uint32_t>(X.cols())) {
-      std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << X.cols() << std::endl;
-      config.dim = static_cast<uint32_t>(X.cols());
-    }
-  } else {
-    num_vectors = 32;
-    X = GenerateRandomMatrix(num_vectors, config.dim, config.seed);
+  if (!base_dataset_path) {
+    std::cerr << "[ERROR] build_index requires a base dataset path." << std::endl;
+    return 1;
   }
 
-  MatrixRM X_for_ivf = X;
-  VersionId whiten_version = 0;
+  auto matrix_res = LoadFvecs(*base_dataset_path);
+  if (!matrix_res.ok()) {
+    std::cerr << matrix_res.status().ToString() << std::endl;
+    return 1;
+  }
+  MatrixRM X = matrix_res.value();
+  if (config.dim != static_cast<uint32_t>(X.cols())) {
+    std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << X.cols() << std::endl;
+    config.dim = static_cast<uint32_t>(X.cols());
+  }
+
+  MatrixRM X_train = X;
+  auto whitening = CreateWhiteningModel();
   if (config.use_whitening) {
     auto whiten_version_res = whitening->Fit(X);
     if (!whiten_version_res.ok()) {
       std::cerr << whiten_version_res.status().ToString() << std::endl;
       return 1;
     }
-    whiten_version = whiten_version_res.value();
-    auto batch_res = whitening->TransformBatch(X, whiten_version);
+    auto batch_res = whitening->TransformBatch(X, whiten_version_res.value());
     if (!batch_res.ok()) {
       std::cerr << batch_res.status().ToString() << std::endl;
       return 1;
     }
-    X_for_ivf = batch_res.value();
+    X_train = batch_res.value();
   }
 
-  RVQParams rvq_params;
-  rvq_params.num_layers = config.rvq_layers;
-  rvq_params.codewords = config.rvq_codewords;
-
-  MatrixRM rvq_train = config.use_whitening ? X_for_ivf : X;
-
-  auto rvq_version_res = rvq->Train(rvq_train, rvq_params);
-  if (!rvq_version_res.ok()) {
-    std::cerr << rvq_version_res.status().ToString() << std::endl;
+  const bool use_rvq = true;
+  const std::string key = BuildFaissFactoryKey(config, use_rvq);
+  std::unique_ptr<faiss::Index> index(
+      faiss::index_factory(static_cast<int>(config.dim), key.c_str(), faiss::METRIC_L2));
+  if (!index) {
+    std::cerr << "[ERROR] Failed to create faiss index: " << key << std::endl;
     return 1;
   }
-  VersionId rvq_version = rvq_version_res.value();
 
-  std::vector<DocId> ids(num_vectors);
-  for (uint32_t i = 0; i < num_vectors; ++i) {
-    ids[i] = i;
-  }
+  index->train(X_train.rows(), X_train.data());
+  index->add(X_train.rows(), X_train.data());
 
-  IVFParams ivf_params;
-  ivf_params.nlist = std::max(1u, config.ivf_nlist);
-  ivf_params.dim = config.dim;
-  auto ivf_version_res = ivf->Build(X_for_ivf, ids, ivf_params, 1);
-  if (!ivf_version_res.ok()) {
-    std::cerr << ivf_version_res.status().ToString() << std::endl;
-    return 1;
-  }
-  VersionId ivf_version = ivf_version_res.value();
-
-  AlignedVector<VectorRecord> records;
-  records.reserve(num_vectors);
-  for (uint32_t i = 0; i < num_vectors; ++i) {
-    VectorRecord rec;
-    rec.doc_id = ids[i];
-    rec.dim = config.dim;
-    rec.versions = VersionSet{whiten_version, rvq_version, ivf_version};
-    rec.ivf_id = i % std::max(1u, ivf_params.nlist);
-    Eigen::VectorXf original = X.row(i).transpose();
-    Eigen::VectorXf xw = original;
-    if (config.use_whitening) {
-      auto transform_res = whitening->Transform(original, whiten_version, xw);
-      if (!transform_res.ok()) {
-        std::cerr << transform_res.status().ToString() << std::endl;
-        return 1;
-      }
-    }
-    rec.x = xw;
-
-    Eigen::VectorXf residual(config.dim);
-    std::vector<uint32_t> codes;
-    auto encode_res = rvq->Encode(xw, rvq_version, &codes, &residual);
-    if (!encode_res.ok()) {
-      std::cerr << encode_res.status().ToString() << std::endl;
-      return 1;
-    }
-    rec.codes = std::move(codes);
-    records.push_back(rec);
-  }
-
-  Status add_status = ivf->Add(records);
-  LogStatus(add_status, "IVF::Add");
-
-  auto bytes = whitening->Serialize();
-  if (!bytes.ok()) {
-    std::cerr << bytes.status().ToString() << std::endl;
-  }
-  std::cout << "Serialized whitening bytes: " << bytes.value().size() << std::endl;
-
-  return add_status.ok() ? 0 : 1;
+  const std::string out_path = (argc > 3) ? argv[3] : "faiss.index";
+  faiss::write_index(index.get(), out_path.c_str());
+  std::cout << "[INFO] Wrote faiss index to " << out_path << std::endl;
+  return 0;
 }
