@@ -12,7 +12,7 @@ set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "Disable FAISS Python bindings")
 set(FAISS_ENABLE_TESTS OFF CACHE BOOL "Disable FAISS tests")
 set(FAISS_ENABLE_C_API OFF CACHE BOOL "Disable FAISS C API")
 
-add_subdirectory(faiss)
+add_subdirectory(third_party/faiss)
 
 add_library(ann
   src/common/dataset.cpp
