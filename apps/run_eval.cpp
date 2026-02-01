@@ -6,13 +6,16 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <Eigen/Dense>
 
-#include <faiss/index_factory.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFFlat.h>
+#include <faiss/IndexIVFAdditiveQuantizer.h>
 
 #include "common/config.h"
 #include "common/dataset.h"
@@ -26,33 +29,60 @@ using namespace ann;
 
 namespace {
 
-    std::string BuildFaissFactoryKey(const Config& config, bool use_rvq) {
-      if (!use_rvq) {
-        return "IVF" + std::to_string(config.ivf_nlist) + ",Flat";
-      }
-      const uint32_t nbits = static_cast<uint32_t>(std::log2(config.rvq_codewords));
-      return "IVF" + std::to_string(config.ivf_nlist) + ",RQ" +
-             std::to_string(config.rvq_layers) + "x" + std::to_string(nbits);
+bool IsPowerOfTwo(uint32_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+uint32_t ComputeNBits(uint32_t codewords) {
+    uint32_t nbits = 0;
+    while ((1u << nbits) < codewords) {
+        ++nbits;
     }
-    
-    double ComputeFaissMSE(faiss::Index* index, const MatrixRM& data, size_t num_samples = 1000) {
-      const size_t samples = std::min(num_samples, static_cast<size_t>(data.rows()));
-      if (samples == 0) {
+
+    return nbits;
+}
+
+std::unique_ptr<faiss::Index> BuildIvfIndex(
+        const Config& config,
+        bool use_rq,
+        int dim) {
+    if (!use_rq) {
+        auto quantizer = std::make_unique<faiss::IndexFlatL2>(dim);
+        auto index = std::make_unique<faiss::IndexIVFFlat>(
+                quantizer.get(), dim, config.ivf_nlist, faiss::METRIC_L2);
+        quantizer.release();
+        return index;
+    }
+
+    if (!IsPowerOfTwo(config.rvq_codewords)) {
+        throw std::invalid_argument("rvq_codewords must be power of two for RQ");
+    }
+    const uint32_t nbits = ComputeNBits(config.rvq_codewords);
+    auto quantizer = std::make_unique<faiss::IndexFlatL2>(dim);
+    auto index = std::make_unique<faiss::IndexIVFResidualQuantizer>(
+            quantizer.get(), dim, config.ivf_nlist, config.rvq_layers, nbits, faiss::METRIC_L2);
+    quantizer.release();
+    return index;
+}
+
+double ComputeFaissMSE(
+        faiss::Index* index,
+        const MatrixRM& data,
+        size_t num_samples = 1000) {
+    const size_t samples = std::min(num_samples, static_cast<size_t>(data.rows()));
+    if (samples == 0) {
         return 0.0;
-      }
-      double total_err = 0.0;
-      std::vector<float> reconstructed(data.cols());
-      std::vector<uint8_t> codes(index->sa_code_size());
-      for (size_t i = 0; i < samples; ++i) {
-        const float* vec = data.row(static_cast<int>(i)).data();
-        index->sa_encode(1, vec, codes.data());
-        index->sa_decode(1, codes.data(), reconstructed.data());
+    }
+    double total_err = 0.0;
+    std::vector<float> reconstructed(data.cols());
+    for (size_t i = 0; i < samples; ++i) {
+        index->reconstruct(static_cast<faiss::idx_t>(i), reconstructed.data());
         Eigen::Map<const Eigen::VectorXf> rec(reconstructed.data(), data.cols());
         Eigen::VectorXf original = data.row(static_cast<int>(i)).transpose();
         total_err += (original - rec).squaredNorm();
-      }
-      return total_err / static_cast<double>(samples);
     }
+    return total_err / static_cast<double>(samples);
+}
     
 }  // namespace
     
@@ -157,17 +187,22 @@ int main(int argc, char** argv) {
             std::cout << "[Step] Whitening trained (ver " << v_whiten << ")" << std::endl;
         }
 
-        const std::string key = BuildFaissFactoryKey(config, mode.use_rvq);
-        std::unique_ptr<faiss::Index> index( 
-            faiss::index_factory(static_cast<int>(X_train.cols()), key.c_str(), faiss::METRIC_L2));
-        if (!index) {
-            std::cerr << "[Error] Failed to create faiss index: " << key << std::endl;
+        std::unique_ptr<faiss::Index> index;
+        try {
+            std::cout << "[config]" << config.ToString() << std::endl;
+            index = BuildIvfIndex(config, mode.use_rvq, static_cast<int>(X_train.cols()));
+        } catch (const std::exception& ex) {
+            std::cerr << "[Error] Failed to create faiss index: " << ex.what() << std::endl;
             return 1;
         }
     
         index->train(X_train.rows(), X_train.data());
         index->add(X_train.rows(), X_train.data());
-    
+        
+        if (auto* ivf = dynamic_cast<faiss::IndexIVF*>(index.get())) {
+            ivf->make_direct_map();
+        }
+
         if (auto* ivf = dynamic_cast<faiss::IndexIVF*>(index.get())) {
             ivf->nprobe = static_cast<int>(config.nprobe);
         }
